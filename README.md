@@ -2,6 +2,9 @@
 
 [![render](https://github.com/cparsania/ZNF185_Manuscript/actions/workflows/render.yml/badge.svg)](https://github.com/cparsania/ZNF185_Manuscript/actions/workflows/render.yml)
 
+**📊 Rendered reports:** [analysis report](https://cparsania.github.io/ZNF185_Manuscript/) · [methods](https://cparsania.github.io/ZNF185_Manuscript/methods.html)
+*(URLs go live when the repository is made public at publication; until then, download the reports from the latest [Actions run artifacts](https://github.com/cparsania/ZNF185_Manuscript/actions/workflows/render.yml).)*
+
 Reproducible differential-expression analysis for the ZNF185 knockdown RNA-seq
 experiment: control (NT) vs two independent *ZNF185*-targeting shRNAs (SH1,
 SH2), three biological replicates each. Differential expression with DESeq2 via
