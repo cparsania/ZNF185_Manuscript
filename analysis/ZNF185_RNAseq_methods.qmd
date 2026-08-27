@@ -1,0 +1,24 @@
+---
+title: "ZNF185 RNA-seq — Methods"
+format:
+  html:
+    embed-resources: true
+bibliography: references.bib
+link-citations: true
+editor: visual
+---
+
+## RNA sequencing and differential expression analysis
+
+RNA-seq libraries from control (NT) and *ZNF185* shRNA knockdown (SH1, SH2) cells (n = 3 biological replicates per condition) were sequenced on an Illumina NovaSeq X-series instrument as 2 × 150 bp paired-end reads, yielding 28.7–43.0 million read pairs per library. Read quality was assessed with FastQC (v0.12.1) [@fastqc2010], and reads were aligned to the human reference genome (GRCh38, Ensembl release 101) [@yates2020] with STAR (v2.7.10a) [@dobin2013], with 66.1–73.8% of read pairs mapping uniquely per sample. Gene-level fragment counts were generated with featureCounts [@liao2014] from the Rsubread package [@liao2019], counting reversely stranded read pairs with both mates mapped over exons summarized by Ensembl gene identifier. Counts were restricted to protein-coding genes, and genes with ≥ 10 reads in at least one sample (15,045 genes) were tested for differential expression with DESeq2 (v1.52.0) [@love2014] through the VISTA Bioconductor package (v1.1.5) [@vista2026], using Wald tests for the SH1 vs NT, SH2 vs NT, and SH1 vs SH2 contrasts with Benjamini–Hochberg multiple-testing correction [@benjamini1995]; genes with \|log2 fold change\| ≥ 0.578 (1.5-fold) and adjusted p ≤ 0.05 were considered differentially expressed. Genes were annotated with org.Hs.eg.db (v3.23.1) [@orghsegdb2026]. Over-representation analysis of differentially expressed genes against the MSigDB Hallmark collection [@liberzon2015] (retrieved with msigdbr v26.1.0 [@msigdbr2026]) and GO Biological Process terms [@ashburner2000; @goconsortium2023] (gene-set size 10–500), and gene set enrichment analysis [@subramanian2005] of the Hallmark collection with genes ranked by log2 fold change, were performed with clusterProfiler (v4.20.0) [@wu2021] through VISTA. All statistical analyses were carried out in R (v4.6.1) [@r2026] with Bioconductor (v3.23) [@huber2015].
+
+------------------------------------------------------------------------
+
+::: {.callout-note appearance="simple"}
+Full analysis with code, figures, and tables: [ZNF185_RNAseq_VISTA_analysis.qmd](ZNF185_RNAseq_VISTA_analysis.qmd) (rendered report: [ZNF185_RNAseq_VISTA_analysis.html](ZNF185_RNAseq_VISTA_analysis.html)). The extended methods, including full command lines and per-sample mapping statistics, are in that report's *Methods* section.
+:::
+
+## References
+
+::: {#refs}
+:::

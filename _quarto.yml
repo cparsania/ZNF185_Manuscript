@@ -1,0 +1,6 @@
+project:
+  title: "ZNF185_Manuscript"
+  execute-dir: project
+  render:
+    - analysis/ZNF185_RNAseq_VISTA_analysis.qmd
+    - analysis/ZNF185_RNAseq_methods.qmd

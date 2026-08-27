@@ -1,0 +1,880 @@
+---
+title: "ZNF185 RNAseq – VISTA Analysis"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+editor: visual
+params:
+  counts_file: "data/ZNF185_RNAseq_feature_count.txt"
+  pc_genes_file: "data/protein_coding_genes_GRCh38_101.txt"
+  star_log_dir: "data/star_logs"
+  results_dir: "results"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(VISTA)
+library(parcutils)      # alignment summary only — no VISTA equivalent
+library(org.Hs.eg.db)
+library(magrittr)
+library(DT)
+
+# ── Paths (all repo-relative; override via quarto render -P) ─────────────────
+count_matrix_file <- params$counts_file
+pc_genes_file     <- params$pc_genes_file
+star_log_dir      <- params$star_log_dir
+
+out_prefix <- "ZNF185_RNAseq_VISTA"
+out_dir    <- fs::dir_create(params$results_dir, glue::glue("{out_prefix}_cutoff_FC_1.5"))
+
+# ── Cutoffs ──────────────────────────────────────────────────────────────────
+minimum_read_counts <- 10
+minimum_replicates  <- 1
+cutoff_lfc          <- 0.578   # 1.5-fold change
+cutoff_padj         <- 0.05
+
+# ── Sample metadata ──────────────────────────────────────────────────────────
+sample_info <- readr::read_tsv("data/sample_info.tsv", show_col_types = FALSE)
+
+# ── Helper: PDF download button embedded in HTML ──────────────────────────────
+# Saves any ggplot or ComplexHeatmap to a temp PDF, base64-encodes it,
+# and returns a knitr raw-HTML download anchor displayed below the figure.
+dl_plot <- function(p, name, w = 8, h = 6) {
+  tmp <- tempfile(fileext = ".pdf")
+  tryCatch(
+    VISTA::save_vista_plot(p, file = tmp, width = w, height = h),
+    error = function(e) {
+      grDevices::pdf(tmp, width = w, height = h)
+      on.exit(grDevices::dev.off())
+      print(p)
+    }
+  )
+  b64 <- base64enc::base64encode(tmp)
+  knitr::asis_output(sprintf(
+    '\n<p><a download="%s.pdf" href="data:application/pdf;base64,%s" class="btn btn-sm btn-outline-secondary">&#11015; %s.pdf</a></p>\n',
+    name, b64, name
+  ))
+}
+
+# ── Helper: DT table with CSV + Excel download buttons ───────────────────────
+dl_table <- function(df, caption = NULL, page_len = 20) {
+  DT::datatable(
+    df,
+    caption    = caption,
+    extensions = "Buttons",
+    rownames   = FALSE,
+    filter     = "top",
+    options    = list(
+      dom        = "Bfrtip",
+      buttons    = list(
+        list(extend = "csv",   title = NULL, filename = deparse(substitute(df))),
+        list(extend = "excel", title = NULL, filename = deparse(substitute(df)))
+      ),
+      pageLength = page_len,
+      scrollX    = TRUE
+    )
+  )
+}
+```
+
+## Alignment stats
+
+```{r alignment_table}
+#| tbl-cap: "Alignment summary"
+
+star_log_files <- fs::dir_ls(star_log_dir,
+                              glob    = "*Log.final.out",
+                              type    = "file")
+
+names(star_log_files) <- fs::path_file(star_log_files) |>
+  stringr::str_remove("_star_alignLog.final.out")
+
+star_summary <- star_log_files |>
+  purrr::map(~ parcutils::get_star_align_log_summary(.x)) |>
+  purrr::map_df(~ dplyr::bind_rows(.x), .id = "sample") |>
+  tidyr::pivot_wider(names_from = "type", values_from = "val")
+
+align_tbl <- star_summary |> dplyr::select(1:4)
+align_tbl |> knitr::kable(row.names = TRUE)
+```
+
+```{r alignment_table_dt, echo=FALSE}
+dl_table(align_tbl, caption = "Alignment summary (download)")
+```
+
+## Mapping statistics (detailed)
+
+```{r mapping_stats_detailed}
+#| tbl-cap: "Detailed STAR mapping statistics — one row per sample; read counts are read pairs"
+
+parse_star_final_log <- function(file) {
+  ln <- readLines(file)
+  ln <- ln[grepl("|", ln, fixed = TRUE)]
+  tibble::tibble(
+    key   = trimws(sub("\\|.*$", "", ln)),
+    value = trimws(sub("^[^|]*\\|", "", ln))
+  )
+}
+
+num <- function(x) suppressWarnings(as.numeric(gsub("%", "", x, fixed = TRUE)))
+
+mapping_stats_tbl <- purrr::map_df(star_log_files, parse_star_final_log, .id = "sample") |>
+  tidyr::pivot_wider(names_from = key, values_from = value) |>
+  dplyr::transmute(
+    Sample                       = sample,
+    `Input read pairs`           = num(`Number of input reads`),
+    `Avg input length (R1+R2)`   = num(`Average input read length`),
+    `Uniquely mapped`            = num(`Uniquely mapped reads number`),
+    `Uniquely mapped (%)`        = num(`Uniquely mapped reads %`),
+    `Multi-mapped`               = num(`Number of reads mapped to multiple loci`),
+    `Multi-mapped (%)`           = num(`% of reads mapped to multiple loci`),
+    `Too many loci (%)`          = num(`% of reads mapped to too many loci`),
+    `Unmapped, too short (%)`    = num(`% of reads unmapped: too short`),
+    `Unmapped, mismatches (%)`   = num(`% of reads unmapped: too many mismatches`),
+    `Unmapped, other (%)`        = num(`% of reads unmapped: other`),
+    `Mismatch rate per base (%)` = num(`Mismatch rate per base, %`),
+    `Avg mapped length`          = num(`Average mapped length`),
+    `Splices, total`             = num(`Number of splices: Total`),
+    `Splices, annotated (%)`     = round(100 * num(`Number of splices: Annotated (sjdb)`) /
+                                           num(`Number of splices: Total`), 2),
+    `Chimeric (%)`               = num(`% of chimeric reads`)
+  ) |>
+  dplyr::arrange(match(Sample, sample_info$sample_names))
+
+mapping_stats_tbl |>
+  dplyr::mutate(dplyr::across(
+    c(`Input read pairs`, `Uniquely mapped`, `Multi-mapped`, `Splices, total`),
+    ~ format(.x, big.mark = ",", scientific = FALSE)
+  )) |>
+  knitr::kable(align = c("l", rep("r", ncol(mapping_stats_tbl) - 1)))
+```
+
+```{r mapping_stats_detailed_dt, echo=FALSE}
+dl_table(mapping_stats_tbl, caption = "Detailed STAR mapping statistics (download)")
+```
+
+## Alignment summary plot
+
+```{r alignment_plot, fig.height=4, fig.width=6}
+#| fig-cap: "Alignment summary"
+
+align_plt <- parcutils::get_star_align_log_summary_plot(x = star_log_files,
+                                                        is_paired_data = TRUE) +
+  ggplot2::theme_minimal(base_size = 18)
+print(align_plt)
+dl_plot(align_plt, "alignment_summary", w = 6, h = 4)
+```
+
+## Load & filter count matrix
+
+```{r load_counts, cache=TRUE}
+counts_df <- VISTA::read_vista_counts(
+  count_matrix_file,
+  format         = "auto",
+  gene_id_column = "gene_id",
+  return_type    = "data.frame"
+)
+
+# Protein-coding gene identifiers derived once from Homo_sapiens.GRCh38.101.gtf
+# (type == "gene" & gene_biotype == "protein_coding"); the list ships with the
+# repository so the 1.2 GB GTF is not needed to reproduce the analysis.
+prot_cod_ids <- readLines(pc_genes_file)
+
+counts_filtered <- counts_df |> dplyr::filter(gene_id %in% prot_cod_ids)
+
+cat("Genes retained (protein-coding):", nrow(counts_filtered), "\n")
+```
+
+## Create VISTA object
+
+```{r create_vista, cache=TRUE, message=FALSE}
+vista <- VISTA::create_vista(
+  counts            = counts_filtered,
+  sample_info       = sample_info,
+  column_geneid     = "gene_id",
+  group_column      = "groups",
+  group_numerator   = c("SH1", "SH2", "SH1"),
+  group_denominator = c("NT",  "NT",  "SH2"),
+  method            = "deseq2",
+  min_counts        = minimum_read_counts,
+  min_replicates    = minimum_replicates,
+  log2fc_cutoff     = cutoff_lfc,
+  pval_cutoff       = cutoff_padj,
+  p_value_type      = "padj"
+)
+
+cat("Comparisons stored:", paste(names(VISTA::comparisons(vista)), collapse = ", "), "\n")
+```
+
+## Add gene annotations
+
+```{r annotate, cache=TRUE, message=FALSE, warning=FALSE}
+vista <- VISTA::set_rowdata(
+  vista,
+  orgdb   = org.Hs.eg.db::org.Hs.eg.db,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "GENENAME", "GENETYPE", "ENTREZID")
+)
+
+cat("rowData columns:", paste(colnames(SummarizedExperiment::rowData(vista)), collapse = ", "), "\n")
+```
+
+## PCA
+
+```{r pca, fig.height=5, fig.width=6}
+pca_plt <- VISTA::get_pca_plot(vista)
+print(pca_plt)
+dl_plot(pca_plt, "pca_plot", w = 6, h = 5)
+```
+
+## Sample correlation
+
+```{r corr, fig.height=6, fig.width=6}
+corr_plt <- VISTA::get_corr_heatmap(vista,
+                                    label = TRUE,
+                                        label_color = "cyan",
+                                    cluster_by       = "group",
+                                    label_size       = 10,
+                                    base_size        = 16)
+print(corr_plt)
+dl_plot(corr_plt, "correlation_heatmap", w = 6, h = 6)
+```
+
+## ZNF185 knockdown levels
+
+```{r znf185_kd, fig.height=5, fig.width=5}
+znf_plt <- VISTA::get_expression_boxplot(
+  vista,
+  genes         = "ENSG00000147394",
+  display_id    = "SYMBOL",
+  log_transform = TRUE
+)
+print(znf_plt)
+dl_plot(znf_plt, "ZNF185_knockdown_levels", w = 5, h = 5)
+```
+
+## DEG counts
+
+```{r deg_counts, fig.height=4, fig.width=7}
+deg_bar_plt <- VISTA::get_deg_count_barplot(vista)
+print(deg_bar_plt)
+dl_plot(deg_bar_plt, "deg_count_barplot", w = 7, h = 4)
+```
+
+## Overlapping DEGs between SH1 and SH2
+
+```{r deg_overlap, fig.height=5, fig.width=5}
+venn_plt <- VISTA::get_deg_venn_diagram(
+  vista,
+  sample_comparisons = c("SH1_VS_NT", "SH2_VS_NT")
+)
+print(venn_plt)
+dl_plot(venn_plt, "venn_SH1_SH2", w = 5, h = 5)
+```
+
+## Volcano plots
+
+```{r volcano_sh1, fig.height=7, fig.width=6}
+vol_sh1 <- VISTA::get_volcano_plot(vista,
+                                   sample_comparison = "SH1_VS_NT",
+                                   display_id        = "SYMBOL")
+print(vol_sh1)
+dl_plot(vol_sh1, "volcano_SH1_VS_NT", w = 6, h = 7)
+```
+
+```{r volcano_sh2, fig.height=7, fig.width=6}
+vol_sh2 <- VISTA::get_volcano_plot(vista,
+                                   sample_comparison = "SH2_VS_NT",
+                                   display_id        = "SYMBOL")
+print(vol_sh2)
+dl_plot(vol_sh2, "volcano_SH2_VS_NT", w = 6, h = 7)
+```
+
+## Prepare DEG gene sets
+
+```{r deg_genesets}
+sh1_up   <- VISTA::get_genes_by_regulation(vista, "SH1_VS_NT", "Up")[["SH1_VS_NT"]]
+sh1_down <- VISTA::get_genes_by_regulation(vista, "SH1_VS_NT", "Down")[["SH1_VS_NT"]]
+sh2_up   <- VISTA::get_genes_by_regulation(vista, "SH2_VS_NT", "Up")[["SH2_VS_NT"]]
+sh2_down <- VISTA::get_genes_by_regulation(vista, "SH2_VS_NT", "Down")[["SH2_VS_NT"]]
+
+all_degs    <- unique(c(sh1_up, sh1_down, sh2_up, sh2_down))
+common_up   <- intersect(sh1_up, sh2_up)
+common_down <- intersect(sh1_down, sh2_down)
+common_degs <- unique(c(common_up, common_down))
+
+cat("SH1_VS_NT — up:", length(sh1_up), "| down:", length(sh1_down), "\n")
+cat("SH2_VS_NT — up:", length(sh2_up), "| down:", length(sh2_down), "\n")
+cat("Common up:", length(common_up), "| Common down:", length(common_down), "\n")
+```
+
+## Heatmaps — all DEGs
+
+```{r heatmap_all_zscore, fig.height=8, fig.width=6}
+ht_all_z <- VISTA::get_expression_heatmap(
+  vista,
+  genes           = all_degs,
+  value_transform = "zscore",
+  show_row_names  = FALSE,
+  display_id      = "SYMBOL",
+  color_default   = FALSE,
+  col             = circlize::colorRamp2(c(-2, 0, 2), c("blue4", "white", "red4")),
+  heatmap_name    = "Z-Score"
+)
+ComplexHeatmap::draw(ht_all_z)
+dl_plot(ht_all_z, "heatmap_all_degs_zscore", w = 6, h = 8)
+```
+
+```{r heatmap_all_lfc, fig.height=8, fig.width=5}
+ht_all_lfc <- VISTA::get_foldchange_heatmap(
+  vista,
+  sample_comparisons = c("SH1_VS_NT", "SH2_VS_NT"),
+  genes              = all_degs,
+  show_row_names     = FALSE,
+  display_id         = "SYMBOL",
+  color_default      = FALSE,
+  col                = circlize::colorRamp2(c(-2, 0, 2), c("blue4", "white", "red4")),
+  heatmap_name       = "log2FC"
+)
+ComplexHeatmap::draw(ht_all_lfc)
+dl_plot(ht_all_lfc, "heatmap_all_degs_log2FC", w = 5, h = 8)
+```
+
+## Heatmaps — common DEGs (SH1 ∩ SH2)
+
+```{r heatmap_common_zscore, fig.height=7, fig.width=6}
+ht_com_z <- VISTA::get_expression_heatmap(
+  vista,
+  genes           = common_degs,
+  value_transform = "zscore",
+  show_row_names  = FALSE,
+  display_id      = "SYMBOL",
+  color_default   = FALSE,
+  col             = circlize::colorRamp2(c(-2, 0, 2), c("blue4", "white", "red4")),
+  heatmap_name    = "Z-Score"
+)
+ComplexHeatmap::draw(ht_com_z)
+dl_plot(ht_com_z, "heatmap_common_degs_zscore", w = 6, h = 7)
+```
+
+```{r heatmap_common_lfc, fig.height=7, fig.width=5}
+ht_com_lfc <- VISTA::get_foldchange_heatmap(
+  vista,
+  sample_comparisons = c("SH1_VS_NT", "SH2_VS_NT"),
+  genes              = common_degs,
+  show_row_names     = FALSE,
+  display_id         = "SYMBOL",
+  color_default      = FALSE,
+  col                = circlize::colorRamp2(c(-2, 0, 2), c("blue4", "white", "red4")),
+  heatmap_name       = "log2FC"
+)
+ComplexHeatmap::draw(ht_com_lfc)
+dl_plot(ht_com_lfc, "heatmap_common_degs_log2FC", w = 5, h = 7)
+```
+
+## Hallmark enrichment (MSigDB)
+
+```{r msigdb_sh1_up, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh1_up_hallmark <- VISTA::get_msigdb_enrichment(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  regulation        = "Up",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  msigdb_category   = "H",
+  species           = "Homo sapiens"
+)
+if (!is.null(sh1_up_hallmark$enrich)) {
+  sh1_up_hallmark$enrich@result <- sh1_up_hallmark$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh1_up_hallmark$enrich, title = "SH1 UP — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "hallmark_SH1_up", w = 12, h = 6)
+}
+```
+
+```{r msigdb_sh1_down, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh1_down_hallmark <- VISTA::get_msigdb_enrichment(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  regulation        = "Down",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  msigdb_category   = "H",
+  species           = "Homo sapiens"
+)
+if (!is.null(sh1_down_hallmark$enrich)) {
+  sh1_down_hallmark$enrich@result <- sh1_down_hallmark$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh1_down_hallmark$enrich, title = "SH1 DOWN — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "hallmark_SH1_down", w = 12, h = 6)
+}
+```
+
+```{r msigdb_sh1_both, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh1_both_hallmark <- VISTA::get_msigdb_enrichment(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  regulation        = "Both",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  msigdb_category   = "H",
+  species           = "Homo sapiens"
+)
+if (!is.null(sh1_both_hallmark$enrich)) {
+  sh1_both_hallmark$enrich@result <- sh1_both_hallmark$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh1_both_hallmark$enrich, title = "SH1 all DEGs — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "hallmark_SH1_all_degs", w = 12, h = 6)
+}
+```
+
+```{r msigdb_sh2_up, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh2_up_hallmark <- VISTA::get_msigdb_enrichment(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  regulation        = "Up",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  msigdb_category   = "H",
+  species           = "Homo sapiens"
+)
+if (!is.null(sh2_up_hallmark$enrich)) {
+  sh2_up_hallmark$enrich@result <- sh2_up_hallmark$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh2_up_hallmark$enrich, title = "SH2 UP — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "hallmark_SH2_up", w = 12, h = 6)
+}
+```
+
+```{r msigdb_sh2_down, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh2_down_hallmark <- VISTA::get_msigdb_enrichment(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  regulation        = "Down",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  msigdb_category   = "H",
+  species           = "Homo sapiens"
+)
+if (!is.null(sh2_down_hallmark$enrich)) {
+  sh2_down_hallmark$enrich@result <- sh2_down_hallmark$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh2_down_hallmark$enrich, title = "SH2 DOWN — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "hallmark_SH2_down", w = 12, h = 6)
+}
+```
+
+```{r msigdb_sh2_both, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh2_both_hallmark <- VISTA::get_msigdb_enrichment(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  regulation        = "Both",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  msigdb_category   = "H",
+  species           = "Homo sapiens"
+)
+if (!is.null(sh2_both_hallmark$enrich)) {
+  sh2_both_hallmark$enrich@result <- sh2_both_hallmark$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh2_both_hallmark$enrich, title = "SH2 all DEGs — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "hallmark_SH2_all_degs", w = 12, h = 6)
+}
+```
+
+## GO:BP enrichment
+
+```{r go_sh1_up, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh1_up_go <- VISTA::get_go_enrichment(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  regulation        = "Up",
+  ont               = "BP",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  minGSSize         = 10,
+  maxGSSize         = 500
+)
+if (!is.null(sh1_up_go$enrich)) {
+  p <- VISTA::get_enrichment_plot(sh1_up_go$enrich, title = "SH1 UP — GO:BP") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "go_bp_SH1_up", w = 12, h = 6)
+}
+```
+
+```{r go_sh1_down, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh1_down_go <- VISTA::get_go_enrichment(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  regulation        = "Down",
+  ont               = "BP",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  minGSSize         = 10,
+  maxGSSize         = 500
+)
+if (!is.null(sh1_down_go$enrich)) {
+  p <- VISTA::get_enrichment_plot(sh1_down_go$enrich, title = "SH1 DOWN — GO:BP") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "go_bp_SH1_down", w = 12, h = 6)
+}
+```
+
+```{r go_sh1_both, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh1_both_go <- VISTA::get_go_enrichment(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  regulation        = "Both",
+  ont               = "BP",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  minGSSize         = 10,
+  maxGSSize         = 500
+)
+if (!is.null(sh1_both_go$enrich)) {
+  p <- VISTA::get_enrichment_plot(sh1_both_go$enrich, title = "SH1 all DEGs — GO:BP") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "go_bp_SH1_all_degs", w = 12, h = 6)
+}
+```
+
+```{r go_sh2_up, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh2_up_go <- VISTA::get_go_enrichment(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  regulation        = "Up",
+  ont               = "BP",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  minGSSize         = 10,
+  maxGSSize         = 500
+)
+if (!is.null(sh2_up_go$enrich)) {
+  p <- VISTA::get_enrichment_plot(sh2_up_go$enrich, title = "SH2 UP — GO:BP") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "go_bp_SH2_up", w = 12, h = 6)
+}
+```
+
+```{r go_sh2_down, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh2_down_go <- VISTA::get_go_enrichment(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  regulation        = "Down",
+  ont               = "BP",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  minGSSize         = 10,
+  maxGSSize         = 500
+)
+if (!is.null(sh2_down_go$enrich)) {
+  p <- VISTA::get_enrichment_plot(sh2_down_go$enrich, title = "SH2 DOWN — GO:BP") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "go_bp_SH2_down", w = 12, h = 6)
+}
+```
+
+```{r go_sh2_both, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+sh2_both_go <- VISTA::get_go_enrichment(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  regulation        = "Both",
+  ont               = "BP",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  minGSSize         = 10,
+  maxGSSize         = 500
+)
+if (!is.null(sh2_both_go$enrich)) {
+  p <- VISTA::get_enrichment_plot(sh2_both_go$enrich, title = "SH2 all DEGs — GO:BP") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "go_bp_SH2_all_degs", w = 12, h = 6)
+}
+```
+
+## GSEA — Hallmark
+
+```{r gsea_sh1, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+set.seed(42)  # GSEA p-value estimation is stochastic; seed for exact reproducibility
+sh1_gsea <- VISTA::get_gsea(
+  vista,
+  sample_comparison = "SH1_VS_NT",
+  set_type          = "msigdb",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  msigdb_category   = "H"
+)
+if (!is.null(sh1_gsea$enrich)) {
+  sh1_gsea$enrich@result <- sh1_gsea$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh1_gsea$enrich, title = "SH1 GSEA — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "gsea_SH1_hallmark", w = 12, h = 6)
+}
+```
+
+```{r gsea_sh2, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+set.seed(42)
+sh2_gsea <- VISTA::get_gsea(
+  vista,
+  sample_comparison = "SH2_VS_NT",
+  set_type          = "msigdb",
+  from_type         = "ENSEMBL",
+  orgdb             = org.Hs.eg.db::org.Hs.eg.db,
+  species           = "Homo sapiens",
+  msigdb_category   = "H"
+)
+if (!is.null(sh2_gsea$enrich)) {
+  sh2_gsea$enrich@result <- sh2_gsea$enrich@result |>
+    dplyr::mutate(Description = stringr::str_remove(Description, "HALLMARK_"))
+  p <- VISTA::get_enrichment_plot(sh2_gsea$enrich, title = "SH2 GSEA — Hallmark") +
+    ggplot2::theme_minimal(base_size = 18)
+  print(p)
+  dl_plot(p, "gsea_SH2_hallmark", w = 12, h = 6)
+}
+```
+
+## Fold-change scatter — SH1 vs SH2
+
+```{r fc_scatter, fig.height=6, fig.width=7}
+fc_scat <- VISTA::get_foldchange_scatter(
+  vista,
+  sample_comparisons = c("SH1_VS_NT", "SH2_VS_NT"),
+  display_id         = "SYMBOL",
+  label_n            = 20,
+  alpha              = 0.5,
+  label_size         = 3,
+  base_size          = 14
+)
+print(fc_scat)
+dl_plot(fc_scat, "foldchange_scatter_SH1_SH2", w = 7, h = 6)
+```
+
+## Downloadable data tables
+
+### DEGs — SH1 vs NT
+
+```{r tbl_degs_sh1, echo=FALSE}
+deg_sh1_tbl <- VISTA::comparisons(vista)[["SH1_VS_NT"]] |>
+  tibble::as_tibble() |>
+  dplyr::left_join(
+    VISTA::row_data(vista) |> as.data.frame() |> dplyr::select(SYMBOL, GENENAME) |> tibble::rownames_to_column("gene_id"),
+    by = "gene_id"
+  ) |>
+  dplyr::relocate(gene_id, SYMBOL, GENENAME)
+dl_table(deg_sh1_tbl, caption = "DEGs — SH1 vs NT")
+```
+
+### DEGs — SH2 vs NT
+
+```{r tbl_degs_sh2, echo=FALSE}
+deg_sh2_tbl <- VISTA::comparisons(vista)[["SH2_VS_NT"]] |>
+  tibble::as_tibble() |>
+  dplyr::left_join(
+    VISTA::row_data(vista) |> as.data.frame() |> dplyr::select(SYMBOL, GENENAME) |> tibble::rownames_to_column("gene_id"),
+    by = "gene_id"
+  ) |>
+  dplyr::relocate(gene_id, SYMBOL, GENENAME)
+dl_table(deg_sh2_tbl, caption = "DEGs — SH2 vs NT")
+```
+
+### DEGs — SH1 vs SH2
+
+```{r tbl_degs_sh1sh2, echo=FALSE}
+deg_sh1sh2_tbl <- VISTA::comparisons(vista)[["SH1_VS_SH2"]] |>
+  tibble::as_tibble() |>
+  dplyr::left_join(
+    VISTA::row_data(vista) |> as.data.frame() |> dplyr::select(SYMBOL, GENENAME) |> tibble::rownames_to_column("gene_id"),
+    by = "gene_id"
+  ) |>
+  dplyr::relocate(gene_id, SYMBOL, GENENAME)
+dl_table(deg_sh1sh2_tbl, caption = "DEGs — SH1 vs SH2")
+```
+
+### DEG overlap table — SH1 and SH2
+
+```{r tbl_venn, echo=FALSE}
+rd_sym <- VISTA::row_data(vista) |>
+  as.data.frame() |>
+  dplyr::select(SYMBOL, GENENAME) |>
+  tibble::rownames_to_column("gene_id")
+
+venn_tbl <- dplyr::tibble(gene_id = unique(c(sh1_up, sh1_down, sh2_up, sh2_down))) |>
+  dplyr::mutate(
+    SH1_VS_NT = dplyr::case_when(
+      gene_id %in% sh1_up   ~ "Up",
+      gene_id %in% sh1_down ~ "Down"
+    ),
+    SH2_VS_NT = dplyr::case_when(
+      gene_id %in% sh2_up   ~ "Up",
+      gene_id %in% sh2_down ~ "Down"
+    ),
+    overlap_class = dplyr::case_when(
+      !is.na(SH1_VS_NT) & !is.na(SH2_VS_NT) & SH1_VS_NT == SH2_VS_NT ~ paste0("Common_", SH1_VS_NT),
+      !is.na(SH1_VS_NT) & !is.na(SH2_VS_NT)                          ~ "Discordant",
+      !is.na(SH1_VS_NT)                                               ~ "SH1_only",
+      TRUE                                                             ~ "SH2_only"
+    )
+  ) |>
+  dplyr::left_join(rd_sym, by = "gene_id") |>
+  dplyr::relocate(gene_id, SYMBOL, GENENAME, overlap_class)
+
+dl_table(venn_tbl, caption = "DEG overlap — SH1 and SH2")
+```
+
+### Normalized counts
+
+```{r tbl_norm_counts, echo=FALSE}
+nc_tbl <- VISTA::norm_counts(vista) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("gene_id") |>
+  dplyr::left_join(
+    VISTA::row_data(vista) |> as.data.frame() |> dplyr::select(SYMBOL) |> tibble::rownames_to_column("gene_id"),
+    by = "gene_id"
+  ) |>
+  dplyr::relocate(gene_id, SYMBOL) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 2)))
+dl_table(nc_tbl, caption = "Normalized counts (DESeq2 median-of-ratios)", page_len = 15)
+```
+
+## Export to disk
+
+```{r export, message=FALSE}
+# Save per-comparison DE tables
+for (comp in names(VISTA::comparisons(vista))) {
+  VISTA::save_vista_data(
+    vista,
+    what              = "comparison",
+    file              = fs::path(out_dir, glue::glue("{out_prefix}_DEG_{comp}.xlsx")),
+    sample_comparison = comp,
+    format            = "xlsx"
+  )
+}
+
+# Normalized counts
+VISTA::save_vista_data(
+  vista,
+  what   = "norm_counts",
+  file   = fs::path(out_dir, glue::glue("{out_prefix}_norm_counts.tsv")),
+  format = "tsv"
+)
+
+# Per-comparison DE result tables (RDS)
+VISTA::save_vista_data(
+  vista,
+  what   = "comparisons",
+  file   = fs::path(params$results_dir, glue::glue("{out_prefix}_vista_object.rds")),
+  format = "rds"
+)
+
+# Standardized asset bundle
+VISTA::export_vista_assets(
+  vista,
+  out_dir           = out_dir,
+  sample_comparison = "SH1_VS_NT",
+  display_id        = "SYMBOL",
+  include_plots     = c("pca", "corr_heatmap", "deg_bar", "volcano", "expression_heatmap"),
+  include_data      = c("comparison", "norm_counts", "deg_summary"),
+  write_excel       = TRUE,
+  overwrite         = TRUE
+)
+
+cat("All outputs written to:\n", out_dir, "\n")
+```
+
+## Methods
+
+### Experimental design and sequencing
+
+Nine RNA-seq libraries were profiled: a control condition (NT) and two independent shRNAs targeting *ZNF185* (SH1, SH2), with three biological replicates per condition. Libraries were sequenced by the Australian Genome Research Facility (AGRF; run `AGRF_NXGSQCAGRF25050371-1_233MTTLT3`) on an Illumina NovaSeq X-series instrument (instrument ID LH00406; flowcell 233MTTLT3) as 2 × 150 bp paired-end reads with dual 10-bp indexes, yielding 28.7–43.0 million read pairs per library. Each sample was sequenced across four lanes; lane-level FASTQ files were concatenated per sample and read (`*_R1_merged.fastq.gz` / `*_R2_merged.fastq.gz`) before alignment. Read quality was assessed on merged FASTQ files with FastQC v0.12.1 (QC reports retained on disk for NT1).
+
+### Reference genome and annotation
+
+All analyses used the human GRCh38 primary assembly with Ensembl release 101 annotation (`Homo_sapiens.GRCh38.dna.primary_assembly.fa`, `Homo_sapiens.GRCh38.101.gtf`). The STAR genome index was built with `--sjdbGTFfile Homo_sapiens.GRCh38.101.gtf --sjdbOverhang 99` (385,187 annotated splice junctions).
+
+### Read alignment
+
+Merged paired-end reads were aligned with STAR v2.7.10a (alignment run August 2025) using splice-aware alignment against the annotated junction database, with coordinate-sorted BAM output: `STAR --runThreadN 6 --genomeLoad LoadAndKeep --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --limitBAMsortRAM 100000000000 --outWigType bedGraph --outWigNorm RPM`. Across samples, 66.1–73.8% of read pairs (20.7–31.7 million) mapped uniquely, 2.1–2.4% mapped to multiple loci, the per-base mismatch rate was 0.23–0.24%, and ≥ 98.8% of detected splices were annotated; no chimeric alignments were reported. Per-sample values are given in the *Mapping statistics (detailed)* table above (computed from the STAR `Log.final.out` files provided in `data/star_logs/`).
+
+### Coverage tracks
+
+Two sets of coverage tracks were generated: (i) RPM-normalized bedGraph signal emitted directly by STAR (`--outWigType bedGraph --outWigNorm RPM`), and (ii) per-sample bigWig tracks produced by scaling genome coverage to reads per million uniquely mapped reads — `bedtools genomecov -bga -split -scale 1e6/N` (where *N* is the sample's uniquely mapped read count from `Log.final.out`), followed by `bedtools sort` and UCSC `bedGraphToBigWig` with the index's `chrNameLength.txt` (bedtools and bedGraphToBigWig versions were not recorded at run time).
+
+### Gene-level quantification
+
+Gene-level counts were obtained with `featureCounts` from the Rsubread package (run August 2025; package version not captured at run time), counting exon features summarized per Ensembl `gene_id` against the same GRCh38.101 GTF. Fragments were counted in paired-end mode requiring both mates to be mapped (`isPairedEnd = TRUE`, `requireBothEndsMapped = TRUE`) with reverse-stranded counting (`strandSpecific = 2`). The resulting 60,671-gene raw count matrix is provided in `data/ZNF185_RNAseq_feature_count.txt`.
+
+### Count filtering and differential expression
+
+Differential expression analysis was performed with the VISTA Bioconductor package v1.1.5 wrapping DESeq2 v1.52.0 (R 4.6.1, Bioconductor 3.23). The count matrix was first restricted to the 19,966 protein-coding genes defined by `gene_biotype == "protein_coding"` in the Ensembl 101 GTF (the derived identifier list is provided in `data/protein_coding_genes_GRCh38_101.txt`). Within `create_vista()`, genes were further required to have ≥ 10 counts in at least one sample (`min_counts = 10`, `min_replicates = 1`); 15,045 genes passed both filters and entered testing. Counts were normalized with DESeq2's median-of-ratios size factors, and three pairwise Wald contrasts were tested: SH1 vs NT, SH2 vs NT, and SH1 vs SH2. Reported log2 fold changes are unshrunken DESeq2 estimates; p-values were adjusted with the Benjamini–Hochberg procedure. Genes were called differentially expressed at |log2FC| ≥ 0.578 (± 1.5-fold) and adjusted p ≤ 0.05.
+
+### Gene annotation
+
+Gene identifiers were annotated with org.Hs.eg.db v3.23.1 (Entrez gene source 2026-03-18; GO source 2026-01-23) via `VISTA::set_rowdata()`, mapping Ensembl gene IDs (version suffixes dropped) to SYMBOL, GENENAME, GENETYPE, and ENTREZID.
+
+### Exploratory analyses
+
+Principal component analysis (`VISTA::get_pca_plot()`) was computed by `prcomp` on centered, unit-variance-scaled normalized counts of all non-constant genes, with the percentage of variance explained reported per component. Sample–sample correlation was visualized as a Pearson correlation heatmap clustered by group (`VISTA::get_corr_heatmap()`). *ZNF185* knockdown (ENSG00000147394) was verified from log-scaled normalized counts (`VISTA::get_expression_boxplot()`).
+
+### Functional enrichment
+
+Over-representation analysis (ORA) was run through VISTA on clusterProfiler v4.20.0, separately for up-regulated, down-regulated, and all DEGs of the SH1 vs NT and SH2 vs NT comparisons, using Ensembl gene IDs. Gene sets were the MSigDB Hallmark collection (category "H", retrieved with msigdbr v26.1.0) and GO Biological Process (gene-set size restricted to 10–500 for GO). For the Hallmark ORA, the background universe was VISTA's default: all expression-filtered genes annotated as protein-coding (GENETYPE = "protein-coding"); the GO:BP ORA used clusterProfiler's default universe (all GO-annotated genes in org.Hs.eg.db). Gene set enrichment analysis (GSEA) on the Hallmark collection used `VISTA::get_gsea()`, which ranks all tested genes by DESeq2 log2 fold change and applies `clusterProfiler::GSEA` (enrichit v0.1.4 backend, multilevel p-value estimation). Enrichment results are shown as dot plots of the top 10 terms ranked by −log10 FDR (`VISTA::get_enrichment_plot()`).
+
+### Visualization and report generation
+
+DEG summaries were visualized with VISTA barplots, Venn diagrams (SH1 ∩ SH2 overlap), and volcano plots. Expression heatmaps show row-wise z-scores of normalized counts and fold-change heatmaps show log2FC, both rendered with ComplexHeatmap v2.28.0 on a blue4–white–red4 scale fixed at ± 2. The SH1 vs SH2 fold-change concordance scatter labels the top 20 genes by combined |log2FC| (Pearson correlation). Alignment QC was summarized from STAR `Log.final.out` files with parcutils v0.1.0. The report was rendered with Quarto to a self-contained HTML document; all tables are exportable (CSV/Excel via DT v0.34.0) and all figures are downloadable as embedded PDFs. Per-comparison DE tables (xlsx), normalized counts (TSV), the per-comparison DE result tables (RDS), and a standardized asset bundle are written to the repository's `results/` directory with `VISTA::save_vista_data()` / `VISTA::export_vista_assets()`.
+
+### Software versions
+
+| Tool / package | Version | Role |
+|---|---|---|
+| FastQC | 0.12.1 | Read quality control |
+| STAR | 2.7.10a | Splice-aware alignment (index `--sjdbOverhang 99`) |
+| bedtools / bedGraphToBigWig | not recorded | Coverage track generation |
+| Rsubread (`featureCounts`) | not recorded (run 2025-08) | Gene-level counting |
+| R | 4.6.1 | Analysis environment |
+| Bioconductor | 3.23 | Package ecosystem |
+| VISTA | 1.1.5 | DE workflow, visualization, enrichment wrappers |
+| DESeq2 | 1.52.0 | Differential expression |
+| org.Hs.eg.db | 3.23.1 | Gene annotation |
+| clusterProfiler | 4.20.0 | ORA / GSEA |
+| msigdbr | 26.1.0 | MSigDB Hallmark gene sets |
+| enrichit | 0.1.4 | GSEA backend (via clusterProfiler) |
+| ComplexHeatmap | 2.28.0 | Heatmaps |
+| parcutils | 0.1.0 | STAR log summaries |
+| DT | 0.34.0 | Interactive tables |
+| ggplot2 | 4.0.3 | Plotting |
+
+### Session information
+
+```{r session_info}
+#| code-fold: true
+sessionInfo()
+```

@@ -1,0 +1,442 @@
+---
+title: "ZNF185 RNAseq – QC Metrics (rRNA rate & Expression Profiling Efficiency)"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+editor: visual
+---
+
+::: {.callout-important}
+**Documentation only — not reproducible from this repository.** This document
+records how the QC metrics were computed on the analysis cluster. It requires
+the nine STAR BAM files (~26 GB; re-derivable from the SRA deposit by
+re-aligning with STAR 2.7.10a) and the `featureCounts` v2.0.6 binary, and it
+references cluster-local paths. It is excluded from the default
+`quarto render` (see `_quarto.yml`). The resulting metrics table ships with
+the repository as `data/ZNF185_RNAseq_QC_metrics.tsv`.
+:::
+
+```{r setup, message=FALSE, warning=FALSE}
+library(rtracklayer)
+library(magrittr)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(readr)
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+path_to_alignment_folder <- "/spectrum/GSCT/chiragp/016_Tinyu/01_ZNF185_RNAseq/02_alignment/"
+gtf_file      <- "/spectrum/GSCT/REF/human/Human-GRCh38-release101/OriginalRef/Homo_sapiens.GRCh38.101.gtf"
+save_dir_path <- "/spectrum/GSCT/chiragp/016_Tinyu/01_ZNF185_RNAseq/05_QC_metrics/"
+data_dir      <- fs::dir_create(fs::path(save_dir_path, "data"))
+gene_matrix_file <- "/spectrum/GSCT/chiragp/016_Tinyu/01_ZNF185_RNAseq/03_ZNF185_analysis/ZNF185_RNAseq_feature_count.txt"
+
+out_prefix <- "ZNF185_RNAseq_QC_metrics"
+
+# ── Counting tool: featureCounts from the pipeline conda env (bioinfoutils) ──
+FC <- "/home/chiragp/miniconda3/envs/bioinfoutils/bin/featureCounts"
+stopifnot(fs::file_exists(FC))
+fc_version <- system2(FC, "-v", stdout = TRUE, stderr = TRUE) |>
+  paste(collapse = " ") |> trimws()
+
+# ── Sample metadata ──────────────────────────────────────────────────────────
+sample_info <- tibble::tribble(
+  ~sample_names, ~groups,
+  "NT1",   "NT",
+  "NT2",   "NT",
+  "NT3",   "NT",
+  "sh1s1", "SH1",
+  "sh1s2", "SH1",
+  "sh1s3", "SH1",
+  "sh2s1", "SH2",
+  "sh2s2", "SH2",
+  "sh2s3", "SH2"
+)
+
+group_cols <- c(NT = "#999999", SH1 = "#E69F00", SH2 = "#009E73")
+
+bam_files <- fs::path(
+  path_to_alignment_folder, sample_info$sample_names,
+  paste0(sample_info$sample_names, "_star_alignAligned.sortedByCoord.out.bam")
+) |> rlang::set_names(sample_info$sample_names)
+stopifnot(all(fs::file_exists(bam_files)))
+
+# ── Helper: PDF download button embedded in HTML ──────────────────────────────
+dl_plot <- function(p, name, w = 8, h = 6) {
+  tmp <- tempfile(fileext = ".pdf")
+  tryCatch(
+    VISTA::save_vista_plot(p, file = tmp, width = w, height = h),
+    error = function(e) {
+      grDevices::pdf(tmp, width = w, height = h)
+      on.exit(grDevices::dev.off())
+      print(p)
+    }
+  )
+  b64 <- base64enc::base64encode(tmp)
+  knitr::asis_output(sprintf(
+    '\n<p><a download="%s.pdf" href="data:application/pdf;base64,%s" class="btn btn-sm btn-outline-secondary">&#11015; %s.pdf</a></p>\n',
+    name, b64, name
+  ))
+}
+
+# ── Helper: DT table with CSV + Excel download buttons ───────────────────────
+dl_table <- function(df, caption = NULL, page_len = 20) {
+  DT::datatable(
+    df,
+    caption    = caption,
+    extensions = "Buttons",
+    rownames   = FALSE,
+    filter     = "top",
+    options    = list(
+      dom        = "Bfrtip",
+      buttons    = list(
+        list(extend = "csv",   title = NULL, filename = deparse(substitute(df))),
+        list(extend = "excel", title = NULL, filename = deparse(substitute(df)))
+      ),
+      pageLength = page_len,
+      scrollX    = TRUE
+    )
+  )
+}
+```
+
+Two per-sample library-composition metrics are computed from the existing STAR alignments (no re-alignment):
+
+-   **rRNA rate** — fragments aligned to rRNA regions / STAR uniquely mapped fragments, in two variants: **(a)** all aligned fragments (multi-mappers included, each counted once at its primary alignment) over rRNA + Mt_rRNA + rRNA_pseudogene features, and **(b)** uniquely mapped fragments over rRNA + Mt_rRNA only.
+-   **Expression Profiling Efficiency (EPE)** — uniquely mapped fragments assigned to any annotated exon / STAR uniquely mapped fragments.
+
+Counting is deliberately **unstranded** (`-s 0`) even though the library is reverse-stranded: the QC intent is to capture reads overlapping rRNA/exon loci regardless of orientation.
+
+## Uniquely mapped fragments (STAR)
+
+```{r star_logs}
+#| tbl-cap: "Denominators from STAR Log.final.out (fragments = read pairs)"
+
+star_log_files <- fs::dir_ls(path_to_alignment_folder,
+                             glob    = "*Log.final.out",
+                             recurse = TRUE,
+                             type    = "file")
+names(star_log_files) <- fs::path_file(star_log_files) |>
+  stringr::str_remove("_star_alignLog.final.out")
+
+parse_star_final_log <- function(file) {
+  ln <- readLines(file)
+  ln <- ln[grepl("|", ln, fixed = TRUE)]
+  tibble::tibble(
+    key   = trimws(sub("\\|.*$", "", ln)),
+    value = trimws(sub("^[^|]*\\|", "", ln))
+  )
+}
+num <- function(x) suppressWarnings(as.numeric(gsub("%", "", x, fixed = TRUE)))
+
+star_tbl <- purrr::map_df(star_log_files, parse_star_final_log, .id = "sample") |>
+  tidyr::pivot_wider(names_from = key, values_from = value) |>
+  dplyr::transmute(
+    sample                 = sample,
+    input_read_pairs       = num(`Number of input reads`),
+    unique_fragments       = num(`Uniquely mapped reads number`),
+    multi_fragments        = num(`Number of reads mapped to multiple loci`),
+    total_mapped_fragments = unique_fragments + multi_fragments
+  ) |>
+  dplyr::arrange(match(sample, sample_info$sample_names))
+
+star_tbl |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ format(.x, big.mark = ","))) |>
+  knitr::kable(align = c("l", rep("r", 4)))
+```
+
+```{r star_logs_dt, echo=FALSE}
+dl_table(star_tbl, caption = "STAR fragment counts (download)")
+```
+
+## rRNA annotation (SAF)
+
+```{r build_saf, cache=TRUE, message=FALSE}
+#| tbl-cap: "rRNA-class features in Homo_sapiens.GRCh38.101.gtf (all single-exon)"
+
+hs_gtf <- rtracklayer::import(gtf_file) |> as.data.frame() |> tibble::as_tibble()
+
+rrna_genes <- hs_gtf |>
+  dplyr::filter(type == "gene",
+                gene_biotype %in% c("rRNA", "Mt_rRNA", "rRNA_pseudogene"))
+
+saf_all <- rrna_genes |>
+  dplyr::transmute(GeneID = gene_id, Chr = seqnames, Start = start,
+                   End = end, Strand = strand)
+saf_uniq <- rrna_genes |>
+  dplyr::filter(gene_biotype %in% c("rRNA", "Mt_rRNA")) |>
+  dplyr::transmute(GeneID = gene_id, Chr = seqnames, Start = start,
+                   End = end, Strand = strand)
+
+stopifnot(nrow(saf_all) == 551, nrow(saf_uniq) == 55)
+
+saf_all_file  <- fs::path(data_dir, "rRNA_all.saf")
+saf_uniq_file <- fs::path(data_dir, "rRNA_uniq.saf")
+readr::write_tsv(saf_all,  saf_all_file)
+readr::write_tsv(saf_uniq, saf_uniq_file)
+
+rrna_genes |> dplyr::count(gene_biotype, name = "features") |> knitr::kable()
+```
+
+```{r saf_guard, include=FALSE}
+# build_saf is cached — regenerate the SAF text files if they were deleted
+saf_all_file  <- fs::path(data_dir, "rRNA_all.saf")
+saf_uniq_file <- fs::path(data_dir, "rRNA_uniq.saf")
+if (!fs::file_exists(saf_all_file))  readr::write_tsv(saf_all,  saf_all_file)
+if (!fs::file_exists(saf_uniq_file)) readr::write_tsv(saf_uniq, saf_uniq_file)
+```
+
+## featureCounts runs
+
+Three counting runs with `r fc_version` from the `bioinfoutils` conda environment (the pipeline environment). Common settings: paired-end fragment counting (`-p --countReadPairs`), unstranded (`-s 0`), fragments overlapping multiple features still assigned (`-O`), 16 threads. Each run is guarded by its `.summary` file, so the ~26 GB of BAMs are only ever read once per run.
+
+```{r fc_runs}
+run_fc <- function(name, extra_args) {
+  out     <- fs::path(data_dir, paste0(name, ".txt"))
+  summary <- paste0(out, ".summary")
+  log     <- fs::path(data_dir, paste0(name, ".log"))
+  if (!fs::file_exists(summary)) {
+    args <- c("-p", "--countReadPairs", "-s", "0", "-T", "16", "-O",
+              extra_args, "-o", out, bam_files)
+    status <- system2(FC, args, stdout = log, stderr = log)
+    stopifnot(status == 0)
+  }
+  summary
+}
+
+sum_rrna_all  <- run_fc("qc_fc_rRNA_all_primary",
+                        c("-F", "SAF", "-a", saf_all_file, "-M", "--primary"))
+sum_rrna_uniq <- run_fc("qc_fc_rRNA_unique",
+                        c("-F", "SAF", "-a", saf_uniq_file))
+sum_exon_uniq <- run_fc("qc_fc_exon_unique",
+                        c("-a", gtf_file, "-t", "exon", "-g", "gene_id"))
+```
+
+-   **Run A** (`rRNA_all_primary`): rRNA + Mt_rRNA + rRNA_pseudogene; `-M --primary` counts every fragment — unique or multi-mapping — exactly once, at its primary alignment (`-M` admits multi-mappers; `--primary` restricts each to its single primary record).
+-   **Run B** (`rRNA_unique`): rRNA + Mt_rRNA; without `-M`, multi-mapping fragments are excluded (`Unassigned_MultiMapping`).
+-   **Run C** (`exon_unique`): all annotated exons (per Ensembl `gene_id`); uniquely mapped fragments only.
+
+Unlike the original gene-count matrix, `-B` (require both ends mapped) is **not** set: a fragment counts if either mate overlaps the target.
+
+## Assignment statistics
+
+```{r assign_stats}
+#| tbl-cap: "featureCounts assignment categories (fragments; zero-only categories hidden)"
+
+read_summary <- function(file, run) {
+  df <- read.delim(file, check.names = FALSE)
+  idx <- match(basename(names(df)[-1]), basename(bam_files))
+  stopifnot(!anyNA(idx))
+  names(df) <- c("Status", names(bam_files)[idx])
+  df |>
+    tidyr::pivot_longer(-Status, names_to = "sample", values_to = "fragments") |>
+    dplyr::mutate(run = run, .before = 1)
+}
+
+stat_long <- dplyr::bind_rows(
+  read_summary(sum_rrna_all,  "A_rRNA_all_primary"),
+  read_summary(sum_rrna_uniq, "B_rRNA_unique"),
+  read_summary(sum_exon_uniq, "C_exon_unique")
+)
+
+stat_wide <- stat_long |>
+  dplyr::group_by(run, Status) |>
+  dplyr::filter(sum(fragments) > 0) |>
+  dplyr::ungroup() |>
+  tidyr::pivot_wider(names_from = sample, values_from = fragments)
+
+stat_wide |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ format(.x, big.mark = ","))) |>
+  knitr::kable(align = c("l", "l", rep("r", 9)))
+```
+
+```{r assign_stats_dt, echo=FALSE}
+dl_table(stat_wide, caption = "Assignment statistics (download)")
+```
+
+## Consistency checks
+
+```{r qc_checks}
+get_stat <- function(run_id, status) {
+  stat_long |>
+    dplyr::filter(run == run_id, Status == status) |>
+    dplyr::arrange(match(sample, sample_info$sample_names)) |>
+    dplyr::pull(fragments)
+}
+totals <- function(run_id) {
+  stat_long |>
+    dplyr::filter(run == run_id) |>
+    dplyr::group_by(sample) |>
+    dplyr::summarise(total = sum(fragments), .groups = "drop") |>
+    dplyr::arrange(match(sample, sample_info$sample_names)) |>
+    dplyr::pull(total)
+}
+
+checks <- tibble::tibble(
+  sample            = sample_info$sample_names,
+  unique_fragments  = star_tbl$unique_fragments,
+  total_mapped      = star_tbl$total_mapped_fragments,
+  A_assigned        = get_stat("A_rRNA_all_primary", "Assigned"),
+  A_nofeat          = get_stat("A_rRNA_all_primary", "Unassigned_NoFeatures"),
+  B_assigned        = get_stat("B_rRNA_unique", "Assigned"),
+  B_nofeat          = get_stat("B_rRNA_unique", "Unassigned_NoFeatures"),
+  C_assigned        = get_stat("C_exon_unique", "Assigned"),
+  C_nofeat          = get_stat("C_exon_unique", "Unassigned_NoFeatures"),
+  B_total           = totals("B_rRNA_unique"),
+  C_total           = totals("C_exon_unique")
+)
+
+check_tbl <- checks |>
+  dplyr::transmute(
+    sample,
+    `B/C totals equal`            = B_total == C_total,
+    `no ambiguity (all runs)`     = get_stat("A_rRNA_all_primary", "Unassigned_Ambiguity") +
+                                    get_stat("B_rRNA_unique", "Unassigned_Ambiguity") +
+                                    get_stat("C_exon_unique", "Unassigned_Ambiguity") == 0,
+    `B: assigned+nofeat = unique` = B_assigned + B_nofeat == unique_fragments,
+    `C: assigned+nofeat = unique` = C_assigned + C_nofeat == unique_fragments,
+    `A: assigned+nofeat = mapped` = A_assigned + A_nofeat == total_mapped
+  )
+knitr::kable(check_tbl)
+stopifnot(unlist(check_tbl[-1]))
+```
+
+All identities hold exactly: with `-O`, no fragment is lost to ambiguity; runs B and C partition the uniquely mapped pool into assigned + no-feature; run A partitions all mapped fragments (unique + multi, once each at the primary alignment).
+
+## QC metrics
+
+```{r metrics_table}
+#| tbl-cap: "Per-sample QC metrics (denominator: STAR uniquely mapped fragments)"
+
+metrics_tbl <- checks |>
+  dplyr::left_join(sample_info, by = c(sample = "sample_names")) |>
+  dplyr::transmute(
+    sample,
+    group                    = groups,
+    unique_fragments,
+    rRNA_fragments_all       = A_assigned,
+    rRNA_rate_all            = A_assigned / unique_fragments,
+    rRNA_fragments_unique    = B_assigned,
+    rRNA_rate_unique         = B_assigned / unique_fragments,
+    exon_fragments_unique    = C_assigned,
+    EPE                      = C_assigned / unique_fragments,
+    rRNA_rate_all_vs_mapped  = A_assigned / total_mapped
+  )
+
+metrics_tbl |>
+  dplyr::mutate(
+    dplyr::across(c(unique_fragments, rRNA_fragments_all, rRNA_fragments_unique,
+                    exon_fragments_unique), ~ format(.x, big.mark = ",")),
+    dplyr::across(c(rRNA_rate_all, rRNA_rate_unique, rRNA_rate_all_vs_mapped),
+                  ~ sprintf("%.3f%%", 100 * .x)),
+    EPE = sprintf("%.1f%%", 100 * EPE)
+  ) |>
+  knitr::kable(align = c("l", "l", rep("r", 8)))
+```
+
+```{r metrics_dt, echo=FALSE}
+dl_table(metrics_tbl, caption = "QC metrics (download)")
+```
+
+`rRNA_rate_all` follows the requested definition (all aligned rRNA fragments over *uniquely* mapped fragments). Because its numerator includes multi-mappers while the denominator does not, the informational column `rRNA_rate_all_vs_mapped` re-expresses the same numerator over all mapped fragments (unique + multi).
+
+## Plots
+
+```{r rrna_plot, fig.height=4, fig.width=9}
+#| fig-cap: "rRNA rate per sample"
+
+rrna_long <- metrics_tbl |>
+  dplyr::select(sample, group, rRNA_rate_all, rRNA_rate_unique) |>
+  tidyr::pivot_longer(dplyr::starts_with("rRNA_rate"),
+                      names_to = "variant", values_to = "rate") |>
+  dplyr::mutate(
+    variant = dplyr::recode(variant,
+      rRNA_rate_all    = "All reads (primary), rRNA + Mt_rRNA + pseudogenes",
+      rRNA_rate_unique = "Unique reads, rRNA + Mt_rRNA"),
+    sample = factor(sample, levels = sample_info$sample_names)
+  )
+
+rrna_plt <- ggplot(rrna_long, aes(sample, rate, fill = group)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f%%", 100 * rate)), vjust = -0.4, size = 3) +
+  facet_wrap(~variant, scales = "free_y") +
+  scale_fill_manual(values = group_cols) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "rRNA rate", fill = "Group") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(rrna_plt)
+dl_plot(rrna_plt, "rRNA_rate_per_sample", w = 9, h = 4)
+```
+
+```{r epe_plot, fig.height=4, fig.width=6}
+#| fig-cap: "Expression Profiling Efficiency per sample"
+
+epe_plt <- metrics_tbl |>
+  dplyr::mutate(sample = factor(sample, levels = sample_info$sample_names)) |>
+  ggplot(aes(sample, EPE, fill = group)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * EPE)), vjust = -0.4, size = 3) +
+  scale_fill_manual(values = group_cols) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1.05),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = NULL, y = "Exon-assigned / uniquely mapped", fill = "Group") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(epe_plt)
+dl_plot(epe_plt, "expression_profiling_efficiency", w = 6, h = 4)
+```
+
+## Cross-check against the gene-level count matrix
+
+```{r crosscheck_gene_matrix}
+#| tbl-cap: "Exon-assigned fragments (this QC) vs column sums of the original gene matrix"
+
+gene_mat <- read.delim(gene_matrix_file, check.names = FALSE)
+gene_sums <- colSums(gene_mat[, sample_info$sample_names])
+
+crosscheck_tbl <- metrics_tbl |>
+  dplyr::transmute(
+    sample,
+    exon_assigned_QC   = exon_fragments_unique,
+    gene_matrix_colsum = gene_sums[sample],
+    ratio              = round(exon_assigned_QC / gene_matrix_colsum, 3)
+  )
+stopifnot(crosscheck_tbl$exon_assigned_QC >= crosscheck_tbl$gene_matrix_colsum)
+
+crosscheck_tbl |>
+  dplyr::mutate(dplyr::across(c(exon_assigned_QC, gene_matrix_colsum),
+                              ~ format(.x, big.mark = ","))) |>
+  knitr::kable(align = c("l", "r", "r", "r"))
+```
+
+The QC exon count is expected to exceed the gene-matrix column sum for every sample: this run is unstranded, allows multi-feature overlap, and does not require both mates mapped, whereas the original matrix was reverse-stranded with both ends required. Typical expectations for poly-A libraries: `rRNA_rate_unique` well below 10%, `rRNA_rate_all` somewhat higher (pseudogene copies capture the multi-mapping rRNA burden), and EPE roughly 0.85–0.97.
+
+## Export
+
+```{r export, message=FALSE}
+readr::write_tsv(metrics_tbl, fs::path(data_dir, paste0(out_prefix, ".tsv")))
+openxlsx::write.xlsx(
+  list(QC_metrics       = metrics_tbl,
+       assignment_stats = stat_wide,
+       gene_matrix_crosscheck = crosscheck_tbl),
+  fs::path(data_dir, paste0(out_prefix, ".xlsx")),
+  overwrite = TRUE
+)
+cat("Outputs written to:\n", as.character(data_dir), "\n")
+```
+
+## Methods
+
+Library-composition QC was computed from the existing STAR 2.7.10a alignments (coordinate-sorted BAMs; no re-alignment). Fragments were counted with `r fc_version` from the project's `bioinfoutils` conda environment, in paired-end fragment mode (`-p --countReadPairs`), unstranded (`-s 0`), with multi-feature overlaps permitted (`-O`) and no requirement that both mates map. The **rRNA rate** numerator used the 551 single-exon rRNA-class features of Ensembl GRCh38 release 101 (53 rRNA, 2 Mt_rRNA, 496 rRNA_pseudogene): variant (a) counted every aligned fragment once at its primary alignment (`-M --primary`; a fragment whose only rRNA overlap is a secondary alignment is not counted — the same semantics as Picard CollectRnaSeqMetrics), while variant (b) counted uniquely mapped fragments over the 55 rRNA + Mt_rRNA features only. The **Expression Profiling Efficiency** numerator counted uniquely mapped fragments assigned to any annotated exon (summarized per Ensembl `gene_id`). Both metrics use STAR's "Uniquely mapped reads number" (fragments) as denominator. Tables and figures were produced in R `r paste(R.version$major, R.version$minor, sep=".")`.
+
+```{r session_info}
+#| code-fold: true
+sessionInfo()
+```

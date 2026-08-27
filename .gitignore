@@ -1,0 +1,10 @@
+# regenerated outputs
+results/
+*.html
+*_cache/
+*_files/
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user
