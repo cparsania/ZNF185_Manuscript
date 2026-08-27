@@ -55,6 +55,13 @@ analysis from `renv.lock` on a clean runner. It triggers on version tags and
 manual dispatch (Actions tab → render → Run workflow); rendered reports are
 attached as workflow artifacts.
 
+Online reports: the workflow also deploys the rendered HTML to GitHub Pages,
+but only once this repository is public (the deploy job is gated on
+visibility). At publication: make the repo public, enable Pages (Settings →
+Pages → Source: *GitHub Actions*), and re-run the workflow — the analysis
+report then lives at <https://cparsania.github.io/ZNF185_Manuscript/> (methods
+at `/methods.html`).
+
 ## Raw data
 
 Raw fastq files and the count matrix are deposited at GEO/SRA:

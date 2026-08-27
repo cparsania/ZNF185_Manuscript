@@ -53,3 +53,31 @@ jobs:
             analysis/*.html
             results/
           retention-days: 30
+
+      - name: Assemble Pages site
+        run: |
+          mkdir -p _site
+          cp analysis/ZNF185_RNAseq_VISTA_analysis.html _site/index.html
+          cp analysis/ZNF185_RNAseq_methods.html _site/methods.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  # Publishes the rendered reports to GitHub Pages. Gated: runs only once the
+  # repository is public (Pages requires a public repo on the free plan), so it
+  # activates automatically when visibility is flipped at publication.
+  # One-time setup then: repo Settings -> Pages -> Source: "GitHub Actions".
+  deploy-pages:
+    needs: render
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
