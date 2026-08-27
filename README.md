@@ -1,5 +1,7 @@
 # ZNF185 knockdown RNA-seq — manuscript analysis
 
+[![render](https://github.com/cparsania/ZNF185_Manuscript/actions/workflows/render.yml/badge.svg)](https://github.com/cparsania/ZNF185_Manuscript/actions/workflows/render.yml)
+
 Reproducible differential-expression analysis for the ZNF185 knockdown RNA-seq
 experiment: control (NT) vs two independent *ZNF185*-targeting shRNAs (SH1,
 SH2), three biological replicates each. Differential expression with DESeq2 via
@@ -47,6 +49,11 @@ quarto render analysis/ZNF185_RNAseq_VISTA_analysis.qmd -P counts_file=/path/to/
 
 GSEA uses stochastic p-value estimation; the qmd sets `set.seed(42)` so
 reruns are exact.
+
+Continuous verification: the `render` GitHub Actions workflow re-runs the full
+analysis from `renv.lock` on a clean runner. It triggers on version tags and
+manual dispatch (Actions tab → render → Run workflow); rendered reports are
+attached as workflow artifacts.
 
 ## Raw data
 

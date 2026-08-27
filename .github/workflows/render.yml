@@ -1,0 +1,55 @@
+name: render
+
+# Runs on manual dispatch and on version tags (e.g. the tagged snapshot
+# archived at submission) — deliberately NOT on every push, to conserve
+# Actions minutes while the repository is private.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}   # for GitHub-hosted packages (VISTA, parcutils)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: quarto-dev/quarto-actions/setup@v2
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.6.1'
+          use-public-rspm: true
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev libxml2-dev libfontconfig1-dev \
+            libharfbuzz-dev libfribidi-dev libfreetype6-dev libpng-dev \
+            libtiff-dev libjpeg-dev libglpk-dev libgmp-dev libmpfr-dev \
+            libcairo2-dev libxt-dev zlib1g-dev libbz2-dev liblzma-dev \
+            libicu-dev
+
+      # Restores the renv library from renv.lock; cached across runs keyed on
+      # the lockfile, so only the first run pays the full install cost.
+      - uses: r-lib/actions/setup-renv@v2
+
+      - name: Render
+        run: quarto render
+
+      - name: Upload rendered reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-reports
+          path: |
+            analysis/*.html
+            results/
+          retention-days: 30
