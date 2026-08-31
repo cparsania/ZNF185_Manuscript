@@ -13,6 +13,8 @@ params:
   results_dir: "results"
 ---
 
+*Report compiled: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")`*
+
 ```{r setup, message=FALSE, warning=FALSE}
 library(VISTA)
 library(parcutils)      # alignment summary only — no VISTA equivalent
@@ -185,6 +187,35 @@ counts_filtered <- counts_df |> dplyr::filter(gene_id %in% prot_cod_ids)
 
 cat("Genes retained (protein-coding):", nrow(counts_filtered), "\n")
 ```
+
+## Expressed genes per replicate
+
+```{r expressed_per_replicate}
+#| tbl-cap: !expr glue::glue("Expressed genes per replicate — genes with >= {minimum_read_counts} reads in that replicate, out of {format(nrow(counts_filtered), big.mark = ',')} protein-coding genes")
+
+count_mat <- counts_filtered |>
+  dplyr::select(-gene_id) |>
+  as.matrix()
+
+expressed_tbl <- tibble::tibble(
+  Sample = colnames(count_mat),
+  Group  = sample_info$groups[match(colnames(count_mat), sample_info$sample_names)],
+  `Expressed genes`          = colSums(count_mat >= minimum_read_counts),
+  `% of protein-coding genes` = round(100 * colSums(count_mat >= minimum_read_counts) /
+                                        nrow(count_mat), 1)
+) |>
+  dplyr::arrange(match(Sample, sample_info$sample_names))
+
+expressed_tbl |>
+  dplyr::mutate(`Expressed genes` = format(`Expressed genes`, big.mark = ",")) |>
+  knitr::kable(align = c("l", "l", "r", "r"))
+```
+
+```{r expressed_per_replicate_dt, echo=FALSE}
+dl_table(expressed_tbl, caption = "Expressed genes per replicate (download)")
+```
+
+A gene is counted as expressed in a replicate when it has at least `r minimum_read_counts` reads in that library. Under the design-level filter used for differential testing (>= `r minimum_read_counts` reads in at least `r minimum_replicates` replicate(s)), `r format(sum(rowSums(count_mat >= minimum_read_counts) >= minimum_replicates), big.mark = ",")` genes are retained.
 
 ## Create VISTA object
 
